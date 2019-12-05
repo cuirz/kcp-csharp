@@ -110,7 +110,30 @@ namespace KcpProject
         {
             return ((Int32)(later - earlier));
         }
+        
+        internal Stack<Segment> msSegmentPool = new Stack<Segment>(32);
 
+        internal Segment Get(int size)
+        {
+            if (msSegmentPool.Count > 0)
+            {
+                var seg = msSegmentPool.Pop();
+                seg.data = ByteBuffer.Allocate(size, true);
+                return seg;
+            }
+            return new Segment(size);
+        }
+
+        internal void Put(Segment seg)
+        {
+            seg.reset();
+            msSegmentPool.Push(seg);
+        }
+
+        public int SegCount
+        {
+            get { return msSegmentPool.Count; }
+        }
         // KCP Segment Definition
         internal class Segment
         {
@@ -128,26 +151,9 @@ namespace KcpProject
             internal UInt32 acked = 0;
             internal ByteBuffer data;
 
-            private static Stack<Segment> msSegmentPool = new Stack<Segment>(32);
+            
 
-            public static Segment Get(int size)
-            {
-                if (msSegmentPool.Count > 0)
-                {
-                    var seg = msSegmentPool.Pop();
-                    seg.data = ByteBuffer.Allocate(size, true);
-                    return seg;
-                }
-                return new Segment(size);
-            }
-
-            public static void Put(Segment seg)
-            {
-                seg.reset();
-                msSegmentPool.Push(seg);
-            }
-
-            private Segment(int size)
+            internal Segment(int size)
             {
                 data = ByteBuffer.Allocate(size, true);
             }
@@ -185,7 +191,14 @@ namespace KcpProject
                 fastack = 0;
                 acked = 0;
 
-                data.Clear();
+                if (data != null)
+                {
+                   releaseData(); 
+                }
+            }
+
+            internal void releaseData()
+            {
                 data.Dispose();
                 data = null;
             }
@@ -201,7 +214,7 @@ namespace KcpProject
         UInt32 conv; UInt32 mtu; UInt32 mss; UInt32 state;
         UInt32 snd_una; UInt32 snd_nxt; UInt32 rcv_nxt;
         UInt32 ts_recent; UInt32 ts_lastack; UInt32 ssthresh;
-        UInt32 rx_rttval; UInt32 rx_srtt;
+        Int32 rx_rttval; Int32 rx_srtt;
         UInt32 rx_rto; UInt32 rx_minrto;
         UInt32 snd_wnd; UInt32 rcv_wnd; UInt32 rmt_wnd; UInt32 cwnd; UInt32 probe;
         UInt32 interval; UInt32 ts_flush;
@@ -226,6 +239,8 @@ namespace KcpProject
         // send windowd & recv window
         public UInt32 SndWnd { get { return snd_wnd; } }
         public UInt32 RcvWnd { get { return rcv_wnd; } }
+        public UInt32 State { get { return state; } }
+        public UInt32 Conv { get { return conv; } }
 
         // get how many packet is waiting to be sent
         public int WaitSnd { get { return snd_buf.Count + snd_queue.Count; } }
@@ -307,7 +322,7 @@ namespace KcpProject
 
                 count++;
                 var fragment = seg.frg;
-                Segment.Put(seg);
+                Put(seg);
                 if (0 == fragment) break;
             }
 
@@ -396,7 +411,7 @@ namespace KcpProject
             {
                 var size = Math.Min(length - readIndex, (int)mss);
 
-                var seg = Segment.Get(size);
+                var seg = Get(size);
                 seg.data.WriteBytes(buffer, readIndex, size);
                 readIndex += size;
 
@@ -412,25 +427,26 @@ namespace KcpProject
         {
             if (0 == rx_srtt)
             {
-                rx_srtt = (UInt32)rtt;
-                rx_rttval = (UInt32)rtt >> 1;
+                rx_srtt = rtt;
+                rx_rttval = rtt >> 1;
             }
             else
             {
-                Int32 delta = (Int32)((UInt32)rtt - rx_srtt);
+                Int32 delta = rtt - rx_srtt;
+                rx_srtt += delta >> 3;
                 if (0 > delta) delta = -delta;
 
                 if (rtt < rx_srtt - rx_rttval)
                 {
-                    rx_rttval += ((uint)delta - rx_rttval) >> 5;
+                    rx_rttval += (delta - rx_rttval) >> 5;
                 }
                 else
                 {
-                    rx_rttval += ((uint)delta - rx_rttval) >> 2;
+                    rx_rttval += (delta - rx_rttval) >> 2;
                 }
             }
 
-            var rto = (int)(rx_srtt + _imax_(interval, rx_rttval << 2));
+            var rto = (int)(rx_srtt + _imax_(interval, (uint)rx_rttval << 2));
             rx_rto = _ibound_(rx_minrto, (UInt32)rto, IKCP_RTO_MAX);
         }
 
@@ -452,7 +468,9 @@ namespace KcpProject
                 if (sn == seg.sn)
                 {
                     seg.acked = 1;
-                    Segment.Put(seg);
+                    // bugfix 不能在这里干掉 seg，在flush中会用到。要么干掉seg 缩减snd_buf，要么在flush中干掉它
+//                    Segment.Put(seg);
+                    seg.releaseData();
                     break;
                 }
                 if (_itimediff(sn, seg.sn) < 0)
@@ -488,7 +506,11 @@ namespace KcpProject
             foreach (var seg in snd_buf)
             {
                 if (_itimediff(una, seg.sn) > 0)
-                    count++;
+                {
+                    // bugfix 这里需要清理一下,snd_buf缩减前，seg需要清理
+                    Put(seg);
+                    count++; 
+                }
                 else
                     break;
             }
@@ -636,7 +658,7 @@ namespace KcpProject
                         ack_push(sn, ts);
                         if (_itimediff(sn, rcv_nxt) >= 0)
                         {
-                            var seg = Segment.Get((int)length);
+                            var seg = Get((int)length);
                             seg.conv = conv_;
                             seg.cmd = (UInt32)cmd;
                             seg.frg = (UInt32)frg;
@@ -732,7 +754,7 @@ namespace KcpProject
         // flush pending data
         public UInt32 Flush(bool ackOnly)
         {
-            var seg = Segment.Get(32);
+            var seg = Get(32);
             seg.conv = conv;
             seg.cmd = IKCP_CMD_ACK;
             seg.wnd = (UInt32)wnd_unused();
@@ -774,6 +796,8 @@ namespace KcpProject
             // flash remain ack segments
             if (ackOnly)
             {
+                // 回收
+                Put(seg);
                 flushBuffer();
                 return interval;
             }
@@ -934,6 +958,8 @@ namespace KcpProject
                 }
             }
 
+            // 回收
+            Put(seg);
             // flash remain segments
             flushBuffer();
 
@@ -1114,6 +1140,15 @@ namespace KcpProject
         public void ReserveBytes(int reservedSize)
         {
             reserved = reservedSize;
+        }
+
+        public void Clear()
+        {
+            msSegmentPool.Clear();
+            snd_buf.Clear();
+            snd_queue.Clear();
+            rcv_buf.Clear();
+            rcv_queue.Clear();
         }
     }
 }
